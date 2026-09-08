@@ -9,8 +9,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-
-TOKEN = os.environ.get("BOT_TOKEN", "ضع_التوكن_الخاص_بك_هنا")
+TOKEN = "8697226305:AAHbh7I_lpqhIItAt-GNByRJ5OLl60L-trs"
 
 users_db = {}
 lottery_participants = set()
