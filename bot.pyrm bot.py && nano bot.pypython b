@@ -1,0 +1,12 @@
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"أهلاً بك {update.effective_user.first_name}، البوت يعمل بنجاح!")
+
+if __name__ == '__main__':
+    app = ApplicationBuilder().token("8697226305:AAHbh7I_lpqhIItAt-GNByRJ5OLl60L-trs").build()
+    app.add_handler(CommandHandler("start", start))
+    print("البوت يعمل الآن...")
+    app.run_polling()
+
