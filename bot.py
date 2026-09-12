@@ -1,18 +1,16 @@
 import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram import Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
 from google import genai
 
-# 1. إعداد خادم فحص الصحة لـ Render
+# 1. خادم فحص الصحة لـ Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -30,12 +28,14 @@ threading.Thread(target=run_health_check, daemon=True).start()
 TOKEN = os.environ.get("BOT_TOKEN", "8697226305:AAGxUICqrnQa0p3Ww54dNE1QZ2PYWfFGcy0")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+ai_client = None
+if GEMINI_API_KEY:
+    try:
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception:
+        pass
 
 users_db = {}
-muted_users = set()
-restricted_users = set()
-warns_db = {}
 active_games = {}
 
 def get_user_data(user_id, name):
@@ -49,14 +49,6 @@ def get_user_data(user_id, name):
         }
     return users_db[user_id]
 
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user = update.effective_user
-    chat = update.effective_chat
-    if chat.type == "private":
-        return True
-    member = await context.bot.get_chat_member(chat.id, user.id)
-    return member.status in ["administrator", "creator"]
-
 # 3. معالج الرسائل والألعاب
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
@@ -64,7 +56,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_data = get_user_data(user.id, user.first_name)
 
-    # التحقق من إجابات الألعاب المفعلة
+    # التحقق من إجابات الألعاب
     if chat_id in active_games:
         correct_answer = active_games[chat_id]["answer"]
         if correct_answer in text:
@@ -77,22 +69,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("عيون رايا 🌹")
         return
 
-    # ألعاب التحديات بالنص العربي (لو خيروك، كت تويت، إلخ)
+    # ألعاب التحديات
     elif text in ["لو خيروك", "كت تويت", "حزوره", "اسالني", "خلوه مع ذاتك", "خلينا نهوجس"]:
         if ai_client:
             try:
                 response = ai_client.models.generate_content(
                     model='gemini-2.5-flash',
-                    contents=f"اعطني سؤال محرج أو تحدي ممتع للعبة '{text}' باللغة العربية العامية وبشكل قصير ومباشر بدون مقدمات."
+                    contents=f"اعطني سؤال محرج أو تحدي ممتع للعبة '{text}' باللغة العربية العامية وبشكل قصير ومباشر."
                 )
                 await update.message.reply_text(response.text)
-            except Exception:
-                await update.message.reply_text("حدث خطأ أثناء الاتصال بالذكاء الاصطناعي.")
+            except Exception as e:
+                await update.message.reply_text(f"حدث خطأ في الذكاء الاصطناعي: {e}")
         else:
-            await update.message.reply_text("يرجى إضافة مفتاح GEMINI_API_KEY لتفعيل الذكاء الاصطناعي.")
+            await update.message.reply_text("يرجى إضافة مفتاح GEMINI_API_KEY في Render لتفعيل الذكاء الاصطناعي.")
         return
 
-    # ألعاب التخمين والعواصم
+    # ألعاب التخمين
     elif text in ["عواصم", "خمن", "تخمين"]:
         if ai_client:
             try:
@@ -110,8 +102,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"🎮 {question}\n\nأول من يكتب الإجابة الصحيحة يفوز!")
                 else:
                     await update.message.reply_text(res_text)
-            except Exception:
-                await update.message.reply_text("حدث خطأ أثناء توليد السؤال.")
+            except Exception as e:
+                await update.message.reply_text(f"حدث خطأ أثناء توليد السؤال: {e}")
+        else:
+            await update.message.reply_text("يرجى إضافة مفتاح GEMINI_API_KEY في Render لتفعيل الذكاء الاصطناعي.")
         return
 
     # قائمة الألعاب
