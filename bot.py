@@ -74,7 +74,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ai_client:
             try:
                 response = ai_client.models.generate_content(
-                    model='gemini-2.5-flash',
+                    model='gemini-3.6-flash',
                     contents=f"اعطني سؤال محرج أو تحدي ممتع للعبة '{text}' باللغة العربية العامية وبشكل قصير ومباشر."
                 )
                 await update.message.reply_text(response.text)
@@ -84,13 +84,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("يرجى إضافة مفتاح GEMINI_API_KEY في Render لتفعيل الذكاء الاصطناعي.")
         return
 
-    # ألعاب التخمين
+    # ألعاب التخمين والعواصم
     elif text in ["عواصم", "خمن", "تخمين"]:
         if ai_client:
             try:
                 prompt = "اعطني سؤالاً بسيطاً في لعبة عواصم أو تخمين بالصيغة التالية تماماً دون أي زيادات:\nالسؤال: [اكتب السؤال هنا]\nالإجابة: [كلمة الإجابة فقط]"
                 response = ai_client.models.generate_content(
-                    model='gemini-2.5-flash',
+                    model='gemini-3.6-flash',
                     contents=prompt
                 )
                 res_text = response.text
