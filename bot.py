@@ -10,8 +10,9 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from google import genai
 
-# 1. Dummy Port HTTP Server (فحص الصحة لـ Render)
+# 1. إعداد خادم فحص الصحة لـ Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -25,16 +26,17 @@ def run_health_check():
 
 threading.Thread(target=run_health_check, daemon=True).start()
 
-# 2. إعدادات البوت وقواعد البيانات
+# 2. إعداد المفاتيح والذكاء الاصطناعي
 TOKEN = os.environ.get("BOT_TOKEN", "8697226305:AAGxUICqrnQa0p3Ww54dNE1QZ2PYWfFGcy0")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 users_db = {}
 muted_users = set()
 restricted_users = set()
 warns_db = {}
-
-def init_db():
-    pass
+active_games = {}
 
 def get_user_data(user_id, name):
     if user_id not in users_db:
@@ -44,7 +46,6 @@ def get_user_data(user_id, name):
             "bank": "الأهلي",
             "type": "فيزا",
             "balance": 4776523806865234528,
-            "transfer_temp": None
         }
     return users_db[user_id]
 
@@ -56,99 +57,64 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     member = await context.bot.get_chat_member(chat.id, user.id)
     return member.status in ["administrator", "creator"]
 
-# 3. دوال الإشراف
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("• هذا الأمر للمشرفين فقط!")
-        return
-    reply = update.message.reply_to_message
-    if not reply:
-        await update.message.reply_text("• يرجى الرد على رسالة العضو المراد طرده.")
-        return
-    await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=reply.from_user.id)
-    await context.bot.unban_chat_member(chat_id=update.effective_chat.id, user_id=reply.from_user.id)
-    await update.message.reply_text(f"• تم طرد العضو [{reply.from_user.first_name}] بنجاح.")
-
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        await update.message.reply_text("• هذا الأمر للمشرفين فقط!")
-        return
-    reply = update.message.reply_to_message
-    if not reply:
-        await update.message.reply_text("• يرجى الرد على رسالة العضو لإنذاره.")
-        return
-    u_id = reply.from_user.id
-    count = warns_db.get(u_id, 0) + 1
-    warns_db[u_id] = count
-    if count >= 3:
-        await context.bot.ban_chat_member(chat_id=update.effective_chat.id, user_id=u_id)
-        warns_db[u_id] = 0
-        await update.message.reply_text(f"• تم حظر [{reply.from_user.first_name}] لوصوله لـ 3 إنذارات.")
-    else:
-        await update.message.reply_text(f"• تم إنذار [{reply.from_user.first_name}]. عدد الإنذارات: ({count}/3)")
-
-async def clear_muted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        return
-    count = len(muted_users)
-    for u_id in list(muted_users):
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id=update.effective_chat.id,
-                user_id=u_id,
-                permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True)
-            )
-        except Exception:
-            pass
-    muted_users.clear()
-    await update.message.reply_text(f"• تم مسح المكتومين وفك الكتم عن ({count}) عضو.")
-
-async def clear_restricted(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, context):
-        return
-    count = len(restricted_users)
-    for u_id in list(restricted_users):
-        try:
-            await context.bot.restrict_chat_member(
-                chat_id=update.effective_chat.id,
-                user_id=u_id,
-                permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True)
-            )
-        except Exception:
-            pass
-    restricted_users.clear()
-    await update.message.reply_text(f"• تم مسح المقيدين وفك التقييد عن ({count}) عضو.")
-
-# 4. معالج الرسائل
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
-    await update.message.reply_text(f"أهلاً بك يا {user_name}! 🌹\nبوت الإدارة والألعاب جاهز للمناداة بـ (رايا).")
-
+# 3. معالج الرسائل والألعاب
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
+    chat_id = update.effective_chat.id
     user = update.effective_user
     user_data = get_user_data(user.id, user.first_name)
+
+    # التحقق من إجابات الألعاب المفعلة
+    if chat_id in active_games:
+        correct_answer = active_games[chat_id]["answer"]
+        if correct_answer in text:
+            await update.message.reply_text(f"كفو يا {user.first_name}! 🥳 إجابة صحيحة: ({correct_answer})")
+            del active_games[chat_id]
+            return
 
     # المناداة
     if text == "رايا":
         await update.message.reply_text("عيون رايا 🌹")
         return
 
-    # أوامر الإشراف
-    elif text == "طرد":
-        await kick(update, context)
-        return
-    elif text in ["إنذار", "انذار"]:
-        await warn(update, context)
-        return
-    elif text == "مسح المكتومين":
-        await clear_muted(update, context)
-        return
-    elif text == "مسح المقيدين":
-        await clear_restricted(update, context)
+    # ألعاب التحديات بالنص العربي (لو خيروك، كت تويت، إلخ)
+    elif text in ["لو خيروك", "كت تويت", "حزوره", "اسالني", "خلوه مع ذاتك", "خلينا نهوجس"]:
+        if ai_client:
+            try:
+                response = ai_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=f"اعطني سؤال محرج أو تحدي ممتع للعبة '{text}' باللغة العربية العامية وبشكل قصير ومباشر بدون مقدمات."
+                )
+                await update.message.reply_text(response.text)
+            except Exception:
+                await update.message.reply_text("حدث خطأ أثناء الاتصال بالذكاء الاصطناعي.")
+        else:
+            await update.message.reply_text("يرجى إضافة مفتاح GEMINI_API_KEY لتفعيل الذكاء الاصطناعي.")
         return
 
-    # قائمة الألعاب الجديدة
+    # ألعاب التخمين والعواصم
+    elif text in ["عواصم", "خمن", "تخمين"]:
+        if ai_client:
+            try:
+                prompt = "اعطني سؤالاً بسيطاً في لعبة عواصم أو تخمين بالصيغة التالية تماماً دون أي زيادات:\nالسؤال: [اكتب السؤال هنا]\nالإجابة: [كلمة الإجابة فقط]"
+                response = ai_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt
+                )
+                res_text = response.text
+                if "الإجابة:" in res_text:
+                    parts = res_text.split("الإجابة:")
+                    question = parts[0].replace("السؤال:", "").strip()
+                    answer = parts[1].strip()
+                    active_games[chat_id] = {"answer": answer}
+                    await update.message.reply_text(f"🎮 {question}\n\nأول من يكتب الإجابة الصحيحة يفوز!")
+                else:
+                    await update.message.reply_text(res_text)
+            except Exception:
+                await update.message.reply_text("حدث خطأ أثناء توليد السؤال.")
+        return
+
+    # قائمة الألعاب
     elif text in ["الالعاب", "الألعاب"]:
         games_list = (
             "الرئيسية 🌟\n\n"
@@ -224,21 +190,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(games_list)
         return
 
-    elif text == "توب الفلوس":
-        top_text = (
-            "28 ) 🪙 9,223,370,927,194,901,235\n"
-            "قسورة 🇮🇶☝️\n"
-            "29 ) 🪙 9,223,368,167,820,361,160\n"
-            "أسَاهِيـّكْ .؟ 🇮🇶\n"
-            "30 ) 🪙 9,223,365,817,977,976,980\n"
-            "💲! AHMED 💎\n"
-            "• you )\n"
-            "4,776,523,806,865,234,528 🪙 | 🛡️⚜️القَيصَر⚜️\n\n"
-            "ملاحظة : اي شخص مخالف للعبة بالفلش او خاط يوزر ينحظر من اللعبه وتتصفر فلوسه"
-        )
-        await update.message.reply_text(top_text)
-        return
-
     elif text == "فلوسي":
         await update.message.reply_text(f"فلوسك {user_data['balance']} ريال 🪙")
         return
@@ -258,30 +209,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(account_info)
         return
 
-    elif text == "روليت":
-        keyboard = [
-            [InlineKeyboardButton("🌙 روليت مخفية", callback_data="roulette_hidden")],
-            [InlineKeyboardButton("😎 روليت مكشوفة", callback_data="roulette_open")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🏠 لعبة الروليت\n\n• اختر نوع اللعبة ..", reply_markup=reply_markup)
-        return
-
-    elif text == "قرعة":
-        keyboard = [
-            [InlineKeyboardButton("1", callback_data="lottery_1"), InlineKeyboardButton("2", callback_data="lottery_2")],
-            [InlineKeyboardButton("3", callback_data="lottery_3"), InlineKeyboardButton("4", callback_data="lottery_4")],
-            [InlineKeyboardButton("5", callback_data="lottery_5")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text("🏠 قرعة\n• اختر عدد الفائزين ..", reply_markup=reply_markup)
-        return
-
-# 5. تشغيل البوت
+# 4. تشغيل البوت
 def main():
-    init_db()
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("✅ البوت يعمل بنجاح!")
     app.run_polling()
