@@ -1,4 +1,5 @@
 import os
+import random
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
@@ -9,6 +10,7 @@ from telegram.ext import (
     filters,
 )
 from google import genai
+from google.genai import types
 
 # 1. خادم فحص الصحة لـ Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -75,7 +77,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 response = ai_client.models.generate_content(
                     model='gemini-3.6-flash',
-                    contents=f"اعطني سؤال محرج أو تحدي ممتع للعبة '{text}' باللغة العربية العامية وبشكل قصير ومباشر."
+                    contents=f"اعطني سؤال محرج أو تحدي ممتع للعبة '{text}' باللغة العربية العامية وبشكل قصير ومباشر.",
+                    config=types.GenerateContentConfig(temperature=1.0)
                 )
                 await update.message.reply_text(response.text)
             except Exception as e:
@@ -88,11 +91,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text in ["عواصم", "خمن", "تخمين"]:
         if ai_client:
             try:
-                prompt = "اعطني سؤالاً بسيطاً في لعبة عواصم أو تخمين بالصيغة التالية تماماً دون أي زيادات:\nالسؤال: [اكتب السؤال هنا]\nالإجابة: [كلمة الإجابة فقط]"
+                regions = ["آسيا", "أوروبا", "أفريقيا", "أمريكا اللاتينية", "عربية", "أوقيانوسيا"]
+                chosen_region = random.choice(regions)
+                
+                prompt = (
+                    f"اختر دولة عشوائية وغير مشهورة من منطقة ({chosen_region}) واسأل عن عاصمتها.\n"
+                    "التزم بالتنسيق التالي فقط دون أي مقدمات:\n"
+                    "السؤال: ما هي عاصمة [اسم الدولة]؟\n"
+                    "الإجابة: [اسم العاصمة فقط]"
+                )
+                
                 response = ai_client.models.generate_content(
                     model='gemini-3.6-flash',
-                    contents=prompt
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=1.2)
                 )
+                
                 res_text = response.text
                 if "الإجابة:" in res_text:
                     parts = res_text.split("الإجابة:")
