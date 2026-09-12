@@ -1,7 +1,19 @@
 import os
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatPermissions
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
+# ---------------------------------------------------------
+# 1. Dummy Port HTTP Server (رضاء فحص الصحة في Render)
+# ---------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -14,671 +26,335 @@ def run_health_check():
     server.serve_forever()
 
 threading.Thread(target=run_health_check, daemon=True).start()
-import os
-import sqlite3
-import logging
 
-from dotenv import load_dotenv
-from telegram import Update, ChatPermissions
-from telegram.ext import (
-    Application,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+# ---------------------------------------------------------
+# 2. إعدادات البوت والبيانات
+# ---------------------------------------------------------
+TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-load_dotenv()
+users_db = {}
+muted_users = set()
+restricted_users = set()
+warns_db = {}
 
-TOKEN = os.getenv("BOT_TOKEN")
+def get_user_data(user_id, name):
+    if user_id not in users_db:
+        users_db[user_id] = {
+            "name": name,
+            "account_num": "60929472334683232",
+            "bank": "الأهلي",
+            "type": "فيزا",
+            "balance": 4776523806865234528,
+            "transfer_temp": None
+        }
+    return users_db[user_id]
 
-if not TOKEN:
-    raise RuntimeError("لم يتم العثور على BOT_TOKEN في ملف .env")
-
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
-DB = "raya.db"
-
-
-# =========================
-# قاعدة البيانات
-# =========================
-
-def init_db():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            chat_id INTEGER,
-            user_id INTEGER,
-            username TEXT,
-            first_name TEXT,
-            PRIMARY KEY (chat_id, user_id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS actions (
-            chat_id INTEGER,
-            user_id INTEGER,
-            action TEXT,
-            PRIMARY KEY (chat_id, user_id)
-        )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS warnings (
-            chat_id INTEGER,
-            user_id INTEGER,
-            count INTEGER DEFAULT 0,
-            PRIMARY KEY (chat_id, user_id)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def save_user(chat_id, user):
-    conn = sqlite3.connect(DB)
-    conn.execute("""
-        INSERT OR REPLACE INTO users
-        (chat_id, user_id, username, first_name)
-        VALUES (?, ?, ?, ?)
-    """, (
-        chat_id,
-        user.id,
-        user.username.lower() if user.username else None,
-        user.first_name or ""
-    ))
-    conn.commit()
-    conn.close()
-
-
-def save_action(chat_id, user_id, action):
-    conn = sqlite3.connect(DB)
-    conn.execute("""
-        INSERT OR REPLACE INTO actions
-        (chat_id, user_id, action)
-        VALUES (?, ?, ?)
-    """, (chat_id, user_id, action))
-    conn.commit()
-    conn.close()
-
-
-def remove_action(chat_id, user_id):
-    conn = sqlite3.connect(DB)
-    conn.execute(
-        "DELETE FROM actions WHERE chat_id=? AND user_id=?",
-        (chat_id, user_id)
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_user_by_username(chat_id, username):
-    username = username.replace("@", "").lower()
-
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT user_id, first_name
-        FROM users
-        WHERE chat_id=? AND username=?
-    """, (chat_id, username))
-
-    result = cur.fetchone()
-    conn.close()
-
-    return result
-
-
-def get_actions(chat_id, action):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT user_id
-        FROM actions
-        WHERE chat_id=? AND action=?
-    """, (chat_id, action))
-
-    result = [row[0] for row in cur.fetchall()]
-    conn.close()
-
-    return result
-
-
-# =========================
-# المشرف
-# =========================
-
-async def is_admin(update):
-    chat = update.effective_chat
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     user = update.effective_user
-
+    chat = update.effective_chat
     if chat.type == "private":
-        return False
-
-    member = await chat.get_member(user.id)
-
-    return member.status in ("administrator", "creator")
-
-
-# =========================
-# الشخص المستهدف
-# =========================
-
-async def get_target(update, context):
-
-    message = update.message
-    chat_id = update.effective_chat.id
-
-    # الرد على رسالة
-    if message.reply_to_message:
-        target = message.reply_to_message.from_user
-        save_user(chat_id, target)
-        return target
-
-    # استخدام @username
-    if context.args:
-
-        username = context.args[0]
-
-        result = get_user_by_username(chat_id, username)
-
-        if result:
-            user_id, first_name = result
-
-            class Target:
-                pass
-
-            target = Target()
-            target.id = user_id
-            target.first_name = first_name
-            target.username = username.replace("@", "")
-
-            return target
-
-        await message.reply_text(
-            "⚠️ لم أتعرف على هذا المستخدم.\n"
-            "استخدم الأمر بالرد على رسالته أول مرة."
-        )
-
-    return None
-
-
-# =========================
-# الصلاحيات
-# =========================
-
-async def can_manage(update, target):
-
-    chat = update.effective_chat
-
-    try:
-        member = await chat.get_member(target.id)
-
-        if member.status in ("administrator", "creator"):
-            return False
-
         return True
-
-    except:
-        return True
-
-
-# =========================
-# الكتم
-# =========================
-
-async def mute(update, context):
-
-    if not await is_admin(update):
-        return
-
-    target = await get_target(update, context)
-
-    if not target:
-        await update.message.reply_text(
-            "⚠️ رد على رسالة العضو واكتب:\nكتم"
-        )
-        return
-
-    if not await can_manage(update, target):
-        await update.message.reply_text(
-            "❌ لا يمكنني تنفيذ الأمر على مشرف."
-        )
-        return
-
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=False
-        )
-
-        await update.effective_chat.restrict_member(
-            target.id,
-            permissions=permissions
-        )
-
-        save_action(
-            update.effective_chat.id,
-            target.id,
-            "muted"
-        )
-
-        await update.message.reply_text(
-            f"🔇 تم كتم {target.first_name}"
-        )
-
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text(
-            "❌ لم أستطع كتم العضو."
-        )
-
-
-# =========================
-# فك الكتم
-# =========================
-
-async def unmute(update, context):
-
-    if not await is_admin(update):
-        return
-
-    target = await get_target(update, context)
-
-    if not target:
-        return
-
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True
-        )
-
-        await update.effective_chat.restrict_member(
-            target.id,
-            permissions=permissions
-        )
-
-        remove_action(
-            update.effective_chat.id,
-            target.id
-        )
-
-        await update.message.reply_text(
-            f"🔊 تم فك الكتم عن {target.first_name}"
-        )
-
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text(
-            "❌ حدث خطأ أثناء فك الكتم."
-        )
-
-
-# =========================
-# الحظر
-# =========================
-
-async def ban(update, context):
-
-    if not await is_admin(update):
-        return
-
-    target = await get_target(update, context)
-
-    if not target:
-        return
-
-    if not await can_manage(update, target):
-        await update.message.reply_text(
-            "❌ لا يمكنني حظر مشرف."
-        )
-        return
-
-    try:
-        await update.effective_chat.ban_member(target.id)
-
-        await update.message.reply_text(
-            f"🚫 تم حظر {target.first_name}"
-        )
-
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text(
-            "❌ لم أستطع حظر العضو."
-        )
-
-
-# =========================
-# فك الحظر
-# =========================
-
-async def unban(update, context):
-
-    if not await is_admin(update):
-        return
-
-    target = await get_target(update, context)
-
-    if not target:
-        return
-
-    try:
-        await update.effective_chat.unban_member(
-            target.id,
-            only_if_banned=True
-        )
-
-        await update.message.reply_text(
-            f"✅ تم فك الحظر عن {target.first_name}"
-        )
-
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text(
-            "❌ حدث خطأ أثناء فك الحظر."
-        )
-
-
-# =========================
-# التقييد
-# =========================
-
-async def restrict(update, context):
-
-    if not await is_admin(update):
-        return
-
-    target = await get_target(update, context)
-
-    if not target:
-        return
-
-    if not await can_manage(update, target):
-        await update.message.reply_text(
-            "❌ لا يمكنني تقييد مشرف."
-        )
-        return
-
-    try:
-        permissions = ChatPermissions(
-            can_send_messages=False
-        )
-
-        await update.effective_chat.restrict_member(
-            target.id,
-            permissions=permissions
-        )
-
-        save_action(
-            update.effective_chat.id,
-            target.id,
-            "restricted"
-        )
-
-        await update.message.reply_text(
-            f"⛔ تم تقييد {target.first_name}"
-        )
-
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text(
-            "❌ لم أستطع تقييد العضو."
-        )
-
-
-# =========================
-# الطرد
-# =========================
-
-async def kick(update, context):
-
-    if not await is_admin(update):
-        return
-
-    target = await get_target(update, context)
-
-    if not target:
-        return
-
-    if not await can_manage(update, target):
-        await update.message.reply_text(
-            "❌ لا يمكنني طرد مشرف."
-        )
-        return
-
-    try:
-        await update.effective_chat.ban_member(target.id)
-        await update.effective_chat.unban_member(target.id)
-
-        await update.message.reply_text(
-            f"👢 تم طرد {target.first_name}"
-        )
-
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text(
-            "❌ لم أستطع طرد العضو."
-        )
-
-
-# =========================
-# الإنذار
-# =========================
-
-async def warn(update, context):
-
-    if not await is_admin(update):
-        return
-
-    target = await get_target(update, context)
-
-    if not target:
-        return
-
-    chat_id = update.effective_chat.id
-
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT count FROM warnings
-        WHERE chat_id=? AND user_id=?
-    """, (chat_id, target.id))
-
-    row = cur.fetchone()
-
-    count = (row[0] if row else 0) + 1
-
-    cur.execute("""
-        INSERT OR REPLACE INTO warnings
-        (chat_id, user_id, count)
-        VALUES (?, ?, ?)
-    """, (chat_id, target.id, count))
-
-    conn.commit()
-    conn.close()
-
+    member = await context.bot.get_chat_member(chat.id, user.id)
+    return member.status in ["administrator", "creator"]
+
+# ---------------------------------------------------------
+# 3. الأوامر الأساسية والمناداة وأوامر الإشراف والبنك
+# ---------------------------------------------------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_name = update.effective_user.first_name
     await update.message.reply_text(
-        f"⚠️ تم إعطاء {target.first_name} إنذارًا.\n"
-        f"عدد الإنذارات: {count}"
+        f"أهلاً بك يا {user_name} في البوت! 🌺\n\n"
+        "يمكنك مناداة البوت بكلمة (رايا)، واستخدام الأوامر للألعاب والإدارة."
     )
-
-
-# =========================
-# مسح المكتومين
-# =========================
-
-async def clear_muted(update, context):
-
-    if not await is_admin(update):
-        return
-
-    chat = update.effective_chat
-    users = get_actions(chat.id, "muted")
-
-    count = 0
-
-    permissions = ChatPermissions(
-        can_send_messages=True,
-        can_send_audios=True,
-        can_send_documents=True,
-        can_send_photos=True,
-        can_send_videos=True,
-        can_send_video_notes=True,
-        can_send_voice_notes=True,
-        can_send_polls=True,
-        can_send_other_messages=True,
-        can_add_web_page_previews=True
-    )
-
-    for user_id in users:
-        try:
-            await chat.restrict_member(
-                user_id,
-                permissions=permissions
-            )
-
-            remove_action(chat.id, user_id)
-            count += 1
-
-        except:
-            pass
-
-    await update.message.reply_text(
-        f"🔊 تم فك كتم {count} عضو."
-    )
-
-
-# =========================
-# مسح المقيدين
-# =========================
-
-async def clear_restricted(update, context):
-
-    if not await is_admin(update):
-        return
-
-    chat = update.effective_chat
-    users = get_actions(chat.id, "restricted")
-
-    count = 0
-
-    permissions = ChatPermissions(
-        can_send_messages=True,
-        can_send_audios=True,
-        can_send_documents=True,
-        can_send_photos=True,
-        can_send_videos=True,
-        can_send_video_notes=True,
-        can_send_voice_notes=True,
-        can_send_polls=True,
-        can_send_other_messages=True,
-        can_add_web_page_previews=True
-    )
-
-    for user_id in users:
-        try:
-            await chat.restrict_member(
-                user_id,
-                permissions=permissions
-            )
-
-            remove_action(chat.id, user_id)
-            count += 1
-
-        except:
-            pass
-
-    await update.message.reply_text(
-        f"🔊 تم فك تقييد {count} عضو."
-    )
-
-
-# =========================
-# استقبال الرسائل
-# =========================
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message.text else ""
+    user = update.effective_user
+    chat = update.effective_chat
+    user_data = get_user_data(user.id, user.first_name)
 
-    if not update.message:
+    # 1. المناداة ("رايا")
+    if text == "رايا":
+        await update.message.reply_text("عيون رايا 🌹")
         return
 
-    chat = update.effective_chat
-    user = update.effective_user
+    # ---------------------------------------------------------
+    # قسم أوامر الإشراف والإدارة (تحتاج الرد على رسالة المستخدم)
+    # ---------------------------------------------------------
+    reply = update.message.reply_to_message
+    target_user = reply.from_user if reply else None
 
-    # حفظ كل مستخدم تحدث رايا معه
-    if chat.type != "private":
-        save_user(chat.id, user)
-
-    text = update.message.text.strip()
-
+    # أمر: كتم
     if text == "كتم":
-        await mute(update, context)
+        if not await is_admin(update, context):
+            await update.message.reply_text("• هذا الأمر للمشرفين فقط!")
+            return
+        if not target_user:
+            await update.message.reply_text("• يرجى الرد على رسالة العضو المراد كتمه.")
+            return
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat.id,
+            user_id=target_user.id,
+            permissions=ChatPermissions(can_send_messages=False)
+        )
+        muted_users.add(target_user.id)
+        await update.message.reply_text(f"• تم كتم العضو [{target_user.first_name}] بنجاح.")
+        return
 
-    elif text == "فك كتم":
-        await unmute(update, context)
+    # أمر: إلغاء الكتم / فك الكتم
+    elif text in ["إلغاء الكتم", "فك الكتم", "تكلم"]:
+        if not await is_admin(update, context):
+            return
+        if not target_user:
+            await update.message.reply_text("• يرجى الرد على رسالة العضو.")
+            return
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat.id,
+            user_id=target_user.id,
+            permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True)
+        )
+        muted_users.discard(target_user.id)
+        await update.message.reply_text(f"• تم إلغاء كتم العضو [{target_user.first_name}].")
+        return
 
+    # أمر: حظر
     elif text == "حظر":
-        await ban(update, context)
+        if not await is_admin(update, context):
+            return
+        if not target_user:
+            await update.message.reply_text("• يرجى الرد على رسالة العضو المراد حظره.")
+            return
+        
+        await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user.id)
+        await update.message.reply_text(f"• تم حظر العضو [{target_user.first_name}] من المجموعة.")
+        return
 
-    elif text == "فك حظر":
-        await unban(update, context)
-
+    # أمر: تقييد
     elif text == "تقييد":
-        await restrict(update, context)
+        if not await is_admin(update, context):
+            return
+        if not target_user:
+            await update.message.reply_text("• يرجى الرد على رسالة العضو المراد تقييده.")
+            return
+        
+        await context.bot.restrict_chat_member(
+            chat_id=chat.id,
+            user_id=target_user.id,
+            permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=False)
+        )
+        restricted_users.add(target_user.id)
+        await update.message.reply_text(f"• تم تقييد العضو [{target_user.first_name}] (منع الوسائط).")
+        return
 
-    elif text == "طرد":
-        await kick(update, context)
+    # أمر: إنذار
+    elif text == "إنذار" or text == "انذار":
+        if not await is_admin(update, context):
+            return
+        if not target_user:
+            await update.message.reply_text("• يرجى الرد على رسالة العضو لإعطائه إنذار.")
+            return
+        
+        warns = warns_db.get(target_user.id, 0) + 1
+        warns_db[target_user.id] = warns
+        if warns >= 3:
+            await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user.id)
+            warns_db[target_user.id] = 0
+            await update.message.reply_text(f"• تم حظر [{target_user.first_name}] لوصوله لـ 3 إنذارات.")
+        else:
+            await update.message.reply_text(f"• تم إعطاء إنذار لـ [{target_user.first_name}]. عدد الإنذارات: ({warns}/3)")
+        return
 
-    elif text == "إنذار":
-        await warn(update, context)
-
+    # أمر: مسح المكتومين
     elif text == "مسح المكتومين":
-        await clear_muted(update, context)
+        if not await is_admin(update, context):
+            return
+        count = len(muted_users)
+        for u_id in list(muted_users):
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat.id,
+                    user_id=u_id,
+                    permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True)
+                )
+            except Exception:
+                pass
+        muted_users.clear()
+        await update.message.reply_text(f"• تم مسح قائمة المكتومين وفك الكتم عن ({count}) عضو.")
+        return
 
+    # أمر: مسح المقيدين
     elif text == "مسح المقيدين":
-        await clear_restricted(update, context)
+        if not await is_admin(update, context):
+            return
+        count = len(restricted_users)
+        for u_id in list(restricted_users):
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat.id,
+                    user_id=u_id,
+                    permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True)
+                )
+            except Exception:
+                pass
+        restricted_users.clear()
+        await update.message.reply_text(f"• تم مسح قائمة المقيدين وفك التقييد عن ({count}) عضو.")
+        return
 
+    # ---------------------------------------------------------
+    # قسم الألعاب والبنك
+    # ---------------------------------------------------------
+    elif text == "الالعاب" or text == "الألعاب":
+        games_text = (
+            "الألعاب\n"
+            "أوامر لعبه البنك:\n"
+            "1 - انشاء حساب بنكي ، راتب ، بخشيش ، زرف ، استثمار ، مضاربه ، حظ .\n\n"
+            "2 - اضافة العجلة اكتب العجله ب 5 مليون ومن ضمن جوائزها :\n"
+            "- سيارة ، ماسة ، X2 = يبديل كلشي تستخدمه لمدة 3 دقائق .. والخ\n\n"
+            "3 - ممتلكاتي تستطيع الشراء والبيع واهداء ممتلكاتك أومرها كـمثال :\n"
+            "- شراء 2 سيارة\n"
+            "- اهداء 2 سيارة بالرد\n"
+            "- بيع 2 سيارة\n\n"
+            "4 - الاسهم يمكنك شراء اسهم وبيعيها بالطرق التالية :\n"
+            "- شراء اسهم 2\n"
+            "- بيع اسهم 2\n"
+            "كلشي تتغير نسبة الاسهم اكتب ( سعر الاسهم )لمعرفة نسبتها\n\n"
+            "5 - اضافة فرض البوت يعطيك عشوائي قرض مع وقت للسداد القرض :\n"
+            "- قرض\n"
+            "- سجني\n"
+            "- ديوني\n"
+            "- ديوني بالرد\n"
+            "- سداد ديوني\n"
+            "- سداد ديونه\n"
+            "- اذا اسجنت مستحيل تلعب في أي شيء من البنك حتى تسدد أو يسددون لك .\n\n"
+            "6 - اضافة توب الجروبات اكبر 20 عشرين قروبات يلعبون العاب عاديه كثير بالقروب يتصدرون للتوب .\n\n"
+            "7 - اضافة توب اكبر 10 متفاعلين بالقروب ."
+        )
+        await update.message.reply_text(games_text)
+        return
 
-# =========================
-# تشغيل رايا
-# =========================
+    elif text == "توب الفلوس":
+        top_text = (
+            "28 ) 🪙 9,223,370,927,194,901,235\n"
+            "قسورة 🇮🇶☝️\n"
+            "29 ) 🪙 9,223,368,167,820,361,160\n"
+            "أسَاهِيـّكْ .؟ 🇮🇶\n"
+            "30 ) 🪙 9,223,365,817,977,976,980\n"
+            "💲! AHMED 💎\n"
+            "• you )\n"
+            "4,776,523,806,865,234,528 🪙 | 🛡️⚜️القَيصَر⚜️\n\n"
+            "ملاحظة : اي شخص مخالف للعبة بالفلش او خاط يوزر ينحظر من اللعبه وتتصفر فلوسه"
+        )
+        await update.message.reply_text(top_text)
+        return
 
+    elif text == "فلوسي":
+        await update.message.reply_text(f"فلوسك {user_data['balance']} ريال 🪙")
+        return
+
+    elif text == "حسابي":
+        account_info = (
+            f"حسابي\n"
+            f"• الاسم .. 🛡️⚜️{user.first_name}⚜️\n"
+            f"• الحساب .. {user_data['account_num']}\n"
+            f"• بنك .. ( الاهلي )\n"
+            f"• نوع .. ( فيزا )\n"
+            f"• الرصيد ..\n"
+            f"( {user_data['balance']} ريال )\n"
+            f"• الزرف .. ( 17910 ريال 🪙 )\n"
+            f"• التصنيف .. ( 2050 🏅 )"
+        )
+        await update.message.reply_text(account_info)
+        return
+
+    elif text.startswith("تحويل "):
+        parts = text.split()
+        if len(parts) >= 2:
+            amount = parts[1]
+            user_data["transfer_temp"] = amount
+            await update.message.reply_text(
+                f"تحويل {amount}\n"
+                "• ارسل الحين رقم الحساب البنكي الي تبي تحول له\n-"
+            )
+        return
+
+    elif text == user_data["account_num"]:
+        if user_data.get("transfer_temp"):
+            await update.message.reply_text("• مايمديك تحول لنفسك")
+            user_data["transfer_temp"] = None
+        return
+
+    elif text == "روليت":
+        keyboard = [
+            [InlineKeyboardButton("🌙 روليت مخفية", callback_data="roulette_hidden")],
+            [InlineKeyboardButton("😎 روليت مكشوفة", callback_data="roulette_open")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        roulette_msg = (
+            "🏠 لعبة الروليت\n\n"
+            "• اختر نوع اللعبة ..\n\n"
+            "🌙 روليت مخفية .. لا تظهر اسماء المشاركين\n"
+            "😎 روليت مكشوفة .. تظهر اسماء المشاركين"
+        )
+        await update.message.reply_text(roulette_msg, reply_markup=reply_markup)
+        return
+
+    elif text == "قرعة":
+        keyboard = [
+            [InlineKeyboardButton("1", callback_data="lottery_1"), InlineKeyboardButton("2", callback_data="lottery_2")],
+            [InlineKeyboardButton("3", callback_data="lottery_3"), InlineKeyboardButton("4", callback_data="lottery_4")],
+            [InlineKeyboardButton("5", callback_data="lottery_5")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        lottery_msg = (
+            "🏠 قرعة\n"
+            "👤 بواسطة : 🛡️⚜️القَيصَر⚜️\n\n"
+            "• اختر عدد الفائزين ..\n"
+            "• ملاحظة .. من لا يختار خلال 30 ثانية يتم طرده"
+        )
+        await update.message.reply_text(lottery_msg, reply_markup=reply_markup)
+        return
+
+# ---------------------------------------------------------
+# 4. معالجة الأزرار التفاعلية
+# ---------------------------------------------------------
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data in ["roulette_hidden", "roulette_open"]:
+        keyboard = [
+            [InlineKeyboardButton("✅ انضمام", callback_data="join_game")],
+            [InlineKeyboardButton("🦄 بدء اللعبة", callback_data="start_game")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "🌙 تم إنشاء روليت مخفية\n\n"
+            "• عدد الفائزين 👈 1\n"
+            "• لن تظهر أسماء المشاركين\n"
+            "• اضغط على الزر للانضمام",
+            reply_markup=reply_markup
+        )
+
+    elif query.data == "start_game":
+        await query.answer(
+            text="• يجب أن يكون هناك 3 لاعبين على الأقل\n(الحالي 👈 1)",
+            show_alert=True
+        )
+
+# ---------------------------------------------------------
+# 5. تشغيل التطبيق
+# ---------------------------------------------------------
 def main():
-
-    init_db()
-
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_message
-        )
-    )
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
-    print("رايا تعمل الآن ✅")
-
+    print("✅ تم تشغيل البوت بنجاح مع أوامر الإشراف والمناداة (رايا)!")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
-
